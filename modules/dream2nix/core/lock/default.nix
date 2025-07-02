@@ -2,7 +2,8 @@
   config,
   lib,
   ...
-}: let
+}:
+let
   l = lib // builtins;
   cfg = config.lock;
 
@@ -11,17 +12,14 @@
   data = l.fromJSON (l.readFile file);
   fileExists = l.pathExists file;
 
-  generatedRefreshScript =
-    if cfg.fields == {}
-    then removeLockFileScript
-    else refresh';
+  generatedRefreshScript = if cfg.fields == { } then removeLockFileScript else refresh';
 
   invalidationHashCurrent = l.hashString "sha256" (l.toJSON cfg.invalidationData);
   invalidationHashLocked = fileContent.invalidationHash or null;
   isValid = invalidationHashCurrent == invalidationHashLocked;
 
   # script to remove the lock file if no fields are defined
-  removeLockFileScript = config.deps.writePython3Bin "refresh" {} ''
+  removeLockFileScript = config.deps.writePython3Bin "refresh" { } ''
     import os
     import subprocess
     from pathlib import Path
@@ -38,7 +36,7 @@
   '';
 
   # script to re-compute all fields for the lock file and dump it to a file
-  refresh' = config.deps.writePython3Bin "refresh" {} ''
+  refresh' = config.deps.writePython3Bin "refresh" { } ''
     import tempfile
     import subprocess
     import os
@@ -89,10 +87,12 @@
     print("Add this file to git if flakes is used.")
   '';
 
-  computeFODHash = fod: let
-    drvPath = l.unsafeDiscardStringContext fod.drvPath;
-  in
-    config.deps.writePython3 "update-FOD-hash-${config.name}" {} ''
+  computeFODHash =
+    fod:
+    let
+      drvPath = l.unsafeDiscardStringContext fod.drvPath;
+    in
+    config.deps.writePython3 "update-FOD-hash-${config.name}" { } ''
       import codecs
       import json
       import os
@@ -166,33 +166,28 @@
     ${updateHint}
   '';
 
-  fileContent =
-    if ! fileExists
-    then throw errorMissingFile
-    else data;
+  fileContent = if !fileExists then throw errorMissingFile else data;
 
-  loadField = field: val:
+  loadField =
+    field: val:
     if
       # load the default value (if specified) whenever the field is not found in
       #   the lock file or the lock file doesn't exist.
-      (cfg.fields.${field}.default != null)
-      && (! fileExists || ! fileContent ? ${field})
-    then cfg.fields.${field}.default
-    else if fileContent ? ${field}
-    then fileContent.${field}
-    else throw (errorOutdatedField field);
+      (cfg.fields.${field}.default != null) && (!fileExists || !fileContent ? ${field})
+    then
+      cfg.fields.${field}.default
+    else if fileContent ? ${field} then
+      fileContent.${field}
+    else
+      throw (errorOutdatedField field);
 
-  loadedContent =
-    if !isValid
-    then throw errorOutdated
-    else l.mapAttrs loadField cfg.fields;
+  loadedContent = if !isValid then throw errorOutdated else l.mapAttrs loadField cfg.fields;
 
   # makes a value more lazy to the module system, so it can be overridden
   # without the original value being evaluated.
-  mkLazy =
-    lib.mkOverride
-    (lib.modules.defaultOverridePriority or lib.modules.defaultPriority);
-in {
+  mkLazy = lib.mkOverride (lib.modules.defaultOverridePriority or lib.modules.defaultPriority);
+in
+{
   imports = [
     ./interface.nix
     ../assertions.nix
@@ -219,11 +214,17 @@ in {
     lock.content = mkLazy loadedContent;
 
     lock.isValid = isValid;
-    lock.lib = {inherit computeFODHash;};
+    lock.lib = { inherit computeFODHash; };
 
-    deps = {nixpkgs, ...}:
+    deps =
+      { nixpkgs, ... }:
       l.mapAttrs (_: l.mkOverride 1004) {
-        inherit (nixpkgs) bash coreutils nix writeScriptBin;
+        inherit (nixpkgs)
+          bash
+          coreutils
+          nix
+          writeScriptBin
+          ;
         inherit (nixpkgs.writers) writePython3 writePython3Bin;
       };
   };

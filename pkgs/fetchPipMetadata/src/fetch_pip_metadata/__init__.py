@@ -134,4 +134,50 @@ def fetch_pip_metadata():
                 temp_dir=home,
                 path_mappings=path_mappings,
             )
+
+            # Fill missing hashes using pip download and hash
+            sources = lock.get("sources", {})
+            with tempfile.TemporaryDirectory() as dir:
+                dir_path = Path(dir)
+                for name, entry in sources.items():
+                    if entry.get("sha256") is None:
+                        print(f"Missing sha256 for {name}-{entry['version']}")
+                        package = f"{name}=={entry['version']}"
+                        try:
+                            subprocess.run(
+                                [
+                                    f"{venv_path}/bin/pip",
+                                    "download",
+                                    "--no-deps",
+                                    "--dest",
+                                    dir,
+                                    *json_args["pipFlags"],
+                                    package,
+                                ],
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                            )
+                        except subprocess.CalledProcessError as e:
+                            print(f"Download failed for {package}: {e.stderr}")
+                            continue  # If download fails, skip hash computation
+                        files = list(dir_path.glob("*"))
+                        if files:
+                            result = subprocess.run(
+                                [
+                                    f"{venv_path}/bin/pip",
+                                    "hash",
+                                    str(files[0]),
+                                ],
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                            for line in result.stdout.splitlines():
+                                if "--hash=sha256:" in line:
+                                    entry["sha256"] = line.strip().split("--hash=sha256:")[1]
+                                    print(f"Retrieved sha256:{entry['sha256']} for {name}-{entry['version']}")
+                                    break
+                            # Clean up the downloaded file immediately
+                            files[0].unlink()
             json.dump(lock, f, indent=2, sort_keys=True)
