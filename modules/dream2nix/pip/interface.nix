@@ -3,11 +3,13 @@
   dream2nix,
   specialArgs,
   ...
-}: let
+}:
+let
   l = lib // builtins;
   t = l.types;
-  mkSubmodule = import ../../../lib/internal/mkSubmodule.nix {inherit lib specialArgs;};
-in {
+  mkSubmodule = import ../../../lib/internal/mkSubmodule.nix { inherit lib specialArgs; };
+in
+{
   options.pip = mkSubmodule {
     imports = [
       ../overrides
@@ -36,7 +38,7 @@ in {
       # user interface
       env = l.mkOption {
         type = t.attrsOf t.str;
-        default = {};
+        default = { };
         description = ''
           environment variables exported while locking
         '';
@@ -55,17 +57,27 @@ in {
         '';
         example = "2023-01-01";
         default = null;
-        apply = d:
-          if d != null
-          then l.warn "pypiSnapshot date has been removed, as we didn't see a need for it anymore. Please let us now if you do." d
-          else d;
+        apply =
+          d:
+          if d != null then
+            l.warn "pypiSnapshot date has been removed, as we didn't see a need for it anymore. Please let us now if you do." d
+          else
+            d;
       };
       pipFlags = l.mkOption {
         type = t.listOf t.str;
         description = ''
           list of flags for pip install
         '';
-        default = [];
+        default = [ ];
+      };
+      privateRegistryDomain = l.mkOption {
+        type = t.nullOr t.str;
+        default = null;
+        description = ''
+          The domain of your private PyPI-compatible registry (e.g. "pypi.fury.io").
+          Used to inject authentication tokens into fetch URLs during build.
+        '';
       };
       pipVersion = l.mkOption {
         type = t.str;
@@ -76,14 +88,14 @@ in {
       };
       requirementsList = l.mkOption {
         type = t.listOf t.str;
-        default = [];
+        default = [ ];
         description = ''
           list of strings of requirements.txt entries
         '';
       };
       requirementsFiles = l.mkOption {
         type = t.listOf t.str;
-        default = [];
+        default = [ ];
         description = ''
           list of requirements.txt files
         '';
@@ -123,7 +135,7 @@ in {
 
       buildExtras = l.mkOption {
         type = t.listOf t.str;
-        default = [];
+        default = [ ];
         description = ''
           list of python "extras" to build with. This can be a subset of the
           extras in your lock file.
@@ -132,7 +144,7 @@ in {
 
       nativeBuildInputs = l.mkOption {
         type = t.listOf t.package;
-        default = [];
+        default = [ ];
         description = ''
           list of native packages to include during metadata generation
         '';
@@ -142,10 +154,12 @@ in {
         internal = true;
         # hack because internal=true doesn't propagate to the submodule options
         visible = "shallow";
-        type = t.lazyAttrsOf (t.submoduleWith {
-          inherit specialArgs;
-          modules = [dream2nix.modules.dream2nix.core];
-        });
+        type = t.lazyAttrsOf (
+          t.submoduleWith {
+            inherit specialArgs;
+            modules = [ dream2nix.modules.dream2nix.core ];
+          }
+        );
         description = "drv-parts modules that define python dependencies";
       };
     };

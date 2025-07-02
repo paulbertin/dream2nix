@@ -3,21 +3,84 @@
   lib,
   dream2nix,
   ...
-}: let
+}:
+let
   l = lib // builtins;
   cfg = config.pip;
   python = config.deps.python;
   metadata = config.lock.content.fetchPipMetadata;
+
+  # Option for private registry domain
+  privateRegistryDomain = cfg.privateRegistryDomain or null;
 
   # filter out ignored dependencies
   targets = cfg.targets;
   isRootDrv = drv: cfg.rootDependencies.${drv.name} or false;
   isBuildInput = drv: cfg.buildDependencies.${drv.name} or false;
 
+  # Function to extract token from index-url flags
+  getAuthTokenForUrl =
+    url:
+    let
+      # Extract registry token from pip flags - simpler implementation
+      indexUrls =
+        let
+          # Extract all index URLs from the flags list
+          extractUrls =
+            i: flags:
+            if i >= lib.length flags then
+              [ ]
+            else if lib.elemAt flags i == "--index-url" && i + 1 < lib.length flags then
+              [ (lib.elemAt flags (i + 1)) ] ++ extractUrls (i + 2) flags
+            else
+              extractUrls (i + 1) flags;
+        in
+        extractUrls 0 cfg.pipFlags;
+      # Parse URLs to extract tokens
+      parseUrl =
+        urlString:
+        let
+          parts = builtins.match "([a-zA-Z]+)://([^/@]+@)?([^/]+)(.*)" urlString;
+          protocol = if parts == null then "" else builtins.elemAt parts 0;
+          authority = if parts == null then "" else builtins.elemAt parts 1;
+          host = if parts == null then "" else builtins.elemAt parts 2;
+          path = if parts == null then "" else builtins.elemAt parts 3;
+          token =
+            if authority == null || authority == "" then
+              ""
+            else
+              builtins.substring 0 (builtins.stringLength authority - 1) authority;
+        in
+        {
+          inherit
+            protocol
+            authority
+            host
+            path
+            token
+            ;
+        };
+      tokens = lib.filter (t: t != "") (map (u: (parseUrl u).token) indexUrls);
+      isPrivateRegistry = privateRegistryDomain != null && lib.hasInfix privateRegistryDomain url;
+    in
+    if isPrivateRegistry && tokens != [ ] then lib.head tokens else null;
+
+  # Function to inject token into URL if needed
+  injectTokenIntoUrl =
+    url:
+    let
+      token = getAuthTokenForUrl url;
+      parts = builtins.match "([a-zA-Z]+)://([^/]+)(.*)" url;
+      protocol = if parts == null then "" else builtins.elemAt parts 0;
+      host = if parts == null then "" else builtins.elemAt parts 1;
+      path = if parts == null then "" else builtins.elemAt parts 2;
+      isPrivateRegistry = privateRegistryDomain != null && lib.hasInfix privateRegistryDomain url;
+    in
+    if isPrivateRegistry && token != null then "${protocol}://${token}@${host}${path}" else url;
+
   writers = import ../../../pkgs/writers {
     inherit lib;
-    inherit
-      (config.deps)
+    inherit (config.deps)
       bash
       coreutils
       gawk
@@ -27,123 +90,153 @@
       ;
   };
 
-  drvs =
-    l.mapAttrs (
-      name: info: {
-        imports = [
-          commonModule
-          dependencyModule
-          cfg.overrideAll
-          (cfg.overrides.${name} or {})
-          # include community overrides
-          (dream2nix.overrides.python.${name} or {})
-        ];
-        config = {
-          inherit name;
-          inherit (info) version;
-        };
-      }
-    )
-    metadata.sources;
-
-  dependencyModule = depConfig: let
-    cfg = depConfig.config;
-    setuptools =
-      if cfg.name == "setuptools"
-      then config.deps.python.pkgs.setuptools
-      else config.pip.drvs.setuptools.public or config.deps.python.pkgs.setuptools;
-  in {
-    # deps.python cannot be defined in commonModule as this would trigger an
-    #   infinite recursion.
-    deps = {inherit python;};
-    buildPythonPackage.format = lib.mkDefault (
-      if lib.hasSuffix ".whl" cfg.mkDerivation.src
-      then "wheel"
-      else null
-    );
-
-    mkDerivation.buildInputs =
-      lib.optionals
-      (! lib.hasSuffix ".whl" cfg.mkDerivation.src)
-      [setuptools];
-  };
-
+  # Modified fetchers to handle authentication
   fetchers = {
-    url = info: config.deps.fetchurl {inherit (info) url sha256;};
-    git = info: config.deps.fetchgit {inherit (info) url sha256 rev;};
+    url =
+      info:
+      config.deps.fetchurl {
+        url = injectTokenIntoUrl info.url;
+        inherit (info) sha256;
+      };
+    git = info: config.deps.fetchgit { inherit (info) url sha256 rev; };
     local = info: "${config.paths.projectRoot}/${info.path}";
   };
 
-  commonModule = {config, ...}: {
+  drvs = l.mapAttrs (name: info: {
     imports = [
-      dream2nix.modules.dream2nix.mkDerivation
-      dream2nix.modules.dream2nix.core
-      ../buildPythonPackage
+      commonModule
+      dependencyModule
+      cfg.overrideAll
+      (cfg.overrides.${name} or { })
+      # include community overrides
+      (dream2nix.overrides.python.${name} or { })
     ];
     config = {
-      deps = {nixpkgs, ...}:
-        l.mapAttrs (_: l.mkOverride 1001) {
-          inherit
-            (nixpkgs)
-            autoPatchelfHook
-            bash
-            coreutils
-            gawk
-            gitMinimal
-            mkShell
-            path
-            stdenv
-            unzip
-            writeScript
-            writeScriptBin
-            ;
-          inherit (nixpkgs.pythonManylinuxPackages) manylinux1;
-        };
-      mkDerivation = {
-        src = l.mkDefault (fetchers.${metadata.sources.${config.name}.type} metadata.sources.${config.name});
-        doCheck = l.mkDefault false;
-        dontStrip = l.mkDefault true;
+      inherit name;
+      inherit (info) version;
+    };
+  }) metadata.sources;
 
-        nativeBuildInputs =
-          [config.deps.unzip]
-          ++ (l.optionals config.deps.stdenv.isLinux [config.deps.autoPatchelfHook]);
-        buildInputs =
-          l.optionals config.deps.stdenv.isLinux [config.deps.manylinux1];
-        # This is required for autoPatchelfHook to find .so files from other
-        # python dependencies, like for example libcublas.so.11 from nvidia-cublas-cu11.
-        preFixup = lib.optionalString config.deps.stdenv.isLinux ''
-          addAutoPatchelfSearchPath $propagatedBuildInputs
-        '';
-        propagatedBuildInputs = let
-          depsByExtra = extra: targets.${extra}.${config.name} or [];
-          defaultDeps = targets.default.${config.name} or [];
-          deps = defaultDeps ++ (l.concatLists (l.map depsByExtra cfg.buildExtras));
-        in
-          l.map (name: cfg.drvs.${name}.public.out) deps;
+  dependencyModule =
+    depConfig:
+    let
+      cfg = depConfig.config;
+      setuptools =
+        if cfg.name == "setuptools" then
+          config.deps.python.pkgs.setuptools
+        else
+          config.pip.drvs.setuptools.public or config.deps.python.pkgs.setuptools;
+    in
+    {
+      # deps.python cannot be defined in commonModule as this would trigger an
+      #   infinite recursion.
+      deps = { inherit python; };
+      buildPythonPackage.format = lib.mkDefault (
+        if lib.hasSuffix ".whl" cfg.mkDerivation.src then "wheel" else null
+      );
+
+      mkDerivation.buildInputs = lib.optionals (!lib.hasSuffix ".whl" cfg.mkDerivation.src) [
+        setuptools
+      ];
+    };
+
+  commonModule =
+    { config, ... }:
+    {
+      imports = [
+        dream2nix.modules.dream2nix.mkDerivation
+        dream2nix.modules.dream2nix.core
+        ../buildPythonPackage
+      ];
+      config = {
+        deps =
+          { nixpkgs, ... }:
+          l.mapAttrs (_: l.mkOverride 1001) {
+            inherit (nixpkgs)
+              autoPatchelfHook
+              bash
+              coreutils
+              gawk
+              gitMinimal
+              mkShell
+              path
+              stdenv
+              unzip
+              writeScript
+              writeScriptBin
+              ;
+            inherit (nixpkgs.pythonManylinuxPackages) manylinux1;
+          };
+        mkDerivation = {
+          src = l.mkDefault (
+            fetchers.${metadata.sources.${config.name}.type} metadata.sources.${config.name}
+          );
+          doCheck = l.mkDefault false;
+          dontStrip = l.mkDefault true;
+
+          nativeBuildInputs = [
+            config.deps.unzip
+          ] ++ (l.optionals config.deps.stdenv.isLinux [ config.deps.autoPatchelfHook ]);
+          buildInputs = l.optionals config.deps.stdenv.isLinux [ config.deps.manylinux1 ];
+          # This is required for autoPatchelfHook to find .so files from other
+          # python dependencies, like for example libcublas.so.11 from nvidia-cublas-cu11.
+          preFixup = lib.optionalString config.deps.stdenv.isLinux ''
+            addAutoPatchelfSearchPath $propagatedBuildInputs
+          '';
+          propagatedBuildInputs =
+            let
+              depsByExtra = extra: targets.${extra}.${config.name} or [ ];
+              defaultDeps = targets.default.${config.name} or [ ];
+              deps = defaultDeps ++ (l.concatLists (l.map depsByExtra cfg.buildExtras));
+            in
+            l.map (name: cfg.drvs.${name}.public.out) deps;
+        };
       };
     };
-  };
-in {
+in
+{
   imports = [
     commonModule
     ./interface.nix
     ./pip-hotfixes
   ];
 
-  deps = {nixpkgs, ...}:
+  deps =
+    { nixpkgs, ... }:
     l.mapAttrs (_: l.mkOverride 1002) {
       # This is imported directly instead of depending on dream2nix.packages
       # with the intention to keep modules independent.
       fetchPipMetadataScript = import ../../../pkgs/fetchPipMetadata/script.nix {
         inherit lib;
-        inherit (cfg) env pipFlags pipVersion requirementsList requirementsFiles nativeBuildInputs;
+        inherit (cfg)
+          env
+          pipFlags
+          pipVersion
+          requirementsList
+          requirementsFiles
+          nativeBuildInputs
+          ;
         inherit (config.deps) coreutils nix writePureShellScript;
         inherit (config.paths) findRoot;
-        inherit (nixpkgs) fetchFromGitHub fetchurl gitMinimal nix-prefetch-scripts openssh python3 rustPlatform writeText;
+        inherit (nixpkgs)
+          fetchFromGitHub
+          fetchurl
+          gitMinimal
+          nix-prefetch-scripts
+          openssh
+          python3
+          rustPlatform
+          writeText
+          ;
         pythonInterpreter = "${python}/bin/python";
       };
       setuptools = config.deps.python.pkgs.setuptools;
-      inherit (nixpkgs) nix fetchgit fetchurl writeText;
+      inherit (nixpkgs)
+        nix
+        fetchgit
+        fetchurl
+        writeText
+        ;
       inherit (writers) writePureShellScript;
     };
 
@@ -160,8 +253,7 @@ in {
   lock.invalidationData = {
     pip =
       {
-        inherit
-          (config.pip)
+        inherit (config.pip)
           pypiSnapshotDate
           pipFlags
           pipVersion
@@ -173,7 +265,7 @@ in {
       }
       # including env conditionally to not invalidate all existing lockfiles
       # TODO: refactor once compat is broken through something else
-      // (lib.optionalAttrs (config.pip.env != {}) config.pip.env);
+      // (lib.optionalAttrs (config.pip.env != { }) config.pip.env);
   };
 
   pip = {
@@ -184,41 +276,36 @@ in {
     editables = {
       ${config.name} = config.paths.package;
     };
-    rootDependencies =
-      l.genAttrs (targets.default.${config.name} or []) (_: true);
+    rootDependencies = l.genAttrs (targets.default.${config.name} or [ ]) (_: true);
   };
 
   mkDerivation = {
-    buildInputs = let
-      rootDeps =
-        lib.filterAttrs
-        (name: value: isRootDrv value && isBuildInput value)
-        cfg.drvs;
-    in
+    buildInputs =
+      let
+        rootDeps = lib.filterAttrs (name: value: isRootDrv value && isBuildInput value) cfg.drvs;
+      in
       l.map (drv: drv.public.out) (l.attrValues rootDeps);
 
-    propagatedBuildInputs = let
-      rootDeps =
-        lib.filterAttrs
-        (name: value: isRootDrv value && !isBuildInput value)
-        cfg.drvs;
-    in
+    propagatedBuildInputs =
+      let
+        rootDeps = lib.filterAttrs (name: value: isRootDrv value && !isBuildInput value) cfg.drvs;
+      in
       l.map (drv: drv.public.out) (l.attrValues rootDeps);
   };
 
-  public.pyEnv = let
-    pyEnv' = config.deps.python.withPackages (
-      ps:
+  public.pyEnv =
+    let
+      pyEnv' = config.deps.python.withPackages (
+        ps:
         config.mkDerivation.propagatedBuildInputs
         # the editableShellHook requires wheel and other build system deps.
         ++ config.mkDerivation.buildInputs
-        ++ [config.deps.python.pkgs.wheel]
-    );
-  in
+        ++ [ config.deps.python.pkgs.wheel ]
+      );
+    in
     pyEnv'.override (old: {
       postBuild =
-        old.postBuild
-        or ""
+        old.postBuild or ""
         + ''
           # Nixpkgs ships a sitecustomize.py with all of it's pyEnvs to add support for NIX_PYTHONPATH.
           # This is unfortunate as sitecustomize is a regular module, so there can only be one.
@@ -235,19 +322,19 @@ in {
   public.shellHook = config.pip.editablesShellHook;
   # a dev shell for development
   public.devShell = config.deps.mkShell {
-    packages = [config.public.pyEnv];
+    packages = [ config.public.pyEnv ];
     shellHook = config.pip.editablesShellHook;
     buildInputs =
-      [(config.drvs.tomli.public or config.deps.python.pkgs.tomli)]
+      [ (config.drvs.tomli.public or config.deps.python.pkgs.tomli) ]
       ++ lib.flatten (
-        lib.mapAttrsToList
-        (name: _path: config.drvs.${name}.mkDerivation.buildInputs or [])
-        config.pip.editables
+        lib.mapAttrsToList (
+          name: _path: config.drvs.${name}.mkDerivation.buildInputs or [ ]
+        ) config.pip.editables
       );
     nativeBuildInputs = lib.flatten (
-      lib.mapAttrsToList
-      (name: _path: config.drvs.${name}.mkDerivation.nativeBuildInputs or [])
-      config.pip.editables
+      lib.mapAttrsToList (
+        name: _path: config.drvs.${name}.mkDerivation.nativeBuildInputs or [ ]
+      ) config.pip.editables
     );
   };
 }
